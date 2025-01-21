@@ -260,27 +260,70 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
-    def affine_transform_video(self, video_path):
+    def affine_transform_video(self, video_path, audio_duration=None, video_fps=25):
+        """
+        Transform video frames and extend if needed to match audio duration, even when loading from cache.
+        Args:
+            video_path: Path to the video file
+            audio_duration: Duration of audio in seconds
+            video_fps: Video frames per second
+        """
         # Create cache directory if it doesn't exist
         cache_dir = os.path.join(os.path.dirname(video_path), "face_alignment_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Generate a cache filename based on the video path
+        # Generate base cache filename without audio duration
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         cache_file = os.path.join(cache_dir, f"{video_name}_alignment.npz")
         
-        # Check if cache exists
+        # Calculate required number of frames based on audio duration
+        required_frames = int(audio_duration * video_fps) if audio_duration is not None else None
+        
         if os.path.exists(cache_file):
             print(f"Loading cached face alignment from {cache_file}")
             cached_data = np.load(cache_file, allow_pickle=True)
             faces = torch.from_numpy(cached_data['faces'])
             video_frames = cached_data['video_frames']
-            boxes = cached_data['boxes']
-            affine_matrices = cached_data['affine_matrices']
+            boxes = list(cached_data['boxes'])  # Convert to list for easier manipulation
+            affine_matrices = list(cached_data['affine_matrices'])  # Convert to list for easier manipulation
+            
+            # Adjust cached data to match audio duration
+            if required_frames is not None:
+                current_frames = len(faces)
+                if current_frames < required_frames:
+                    # Extend by looping if too short
+                    num_loops = (required_frames // current_frames) + 1
+                    faces = faces.repeat(num_loops, 1, 1, 1)[:required_frames]
+                    video_frames = np.tile(video_frames, (num_loops, 1, 1, 1))[:required_frames]
+                    
+                    # Extend boxes and affine_matrices by repeating
+                    boxes_extended = []
+                    affine_matrices_extended = []
+                    for i in range(required_frames):
+                        idx = i % current_frames
+                        boxes_extended.append(boxes[idx])
+                        affine_matrices_extended.append(affine_matrices[idx])
+                    boxes = boxes_extended
+                    affine_matrices = affine_matrices_extended
+                    
+                elif current_frames > required_frames:
+                    # Trim if too long
+                    faces = faces[:required_frames]
+                    video_frames = video_frames[:required_frames]
+                    boxes = boxes[:required_frames]
+                    affine_matrices = affine_matrices[:required_frames]
+                
             return faces, video_frames, boxes, affine_matrices
         
         # If no cache exists, perform face alignment
         video_frames = read_video(video_path, use_decord=False)
+        
+        # Adjust video frames length before processing if needed
+        original_length = len(video_frames)
+        if required_frames is not None and original_length < required_frames:
+            num_loops = (required_frames // original_length) + 1
+            video_frames = np.tile(video_frames, (num_loops, 1, 1, 1))[:required_frames]
+        
         faces = []
         boxes = []
         affine_matrices = []
@@ -293,7 +336,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
         faces = torch.stack(faces)
         
-        # Save results to cache
+        # Save original (non-adjusted) results to cache
         print(f"Saving face alignment cache to {cache_file}")
         np.savez(
             cache_file,
@@ -303,8 +346,16 @@ class LipsyncPipeline(DiffusionPipeline):
             affine_matrices=affine_matrices
         )
         
+        # Adjust lengths if needed before returning
+        if required_frames is not None:
+            if len(faces) > required_frames:
+                faces = faces[:required_frames]
+                video_frames = video_frames[:required_frames]
+                boxes = boxes[:required_frames]
+                affine_matrices = affine_matrices[:required_frames]
+        
         return faces, video_frames, boxes, affine_matrices
-
+    
     def restore_video(self, faces, video_frames, boxes, affine_matrices):
         from concurrent.futures import ThreadPoolExecutor
         import multiprocessing
@@ -389,8 +440,15 @@ class LipsyncPipeline(DiffusionPipeline):
         self.image_processor = ImageProcessor(height, mask=mask, device="cuda")
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
-        faces, original_video_frames, boxes, affine_matrices = self.affine_transform_video(video_path)
+        
         audio_samples = read_audio(audio_path)
+        audio_duration = len(audio_samples) / audio_sample_rate
+        faces, original_video_frames, boxes, affine_matrices = self.affine_transform_video(
+            video_path, 
+            audio_duration=audio_duration,
+            video_fps=video_fps
+        )
+        
         step_0 = time.time()
         # 1. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
